@@ -21,9 +21,11 @@ BCDN_APIKEY= <apikey> bunnycdn-storage-sync <local_dir> <zone_name>
 
 Options:
 ```
--dry-run   Show the difference and exit
-```
+-dry-run        Show the difference and exit
+-size-only      Check only size for sync
+-only-missing   Sync only if not exist in remote storage
 
+```
 
 # TODO
 * Parallel processing of filepath
