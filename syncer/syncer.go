@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/mtyurt/bunnycdn-storage-sync/api"
+	"github.com/veter2005/bunny-storage-sync/api"
 )
 
 // BCDNSyncer is the service that runs sync operation

@@ -10,7 +10,7 @@ A simple command-line tool to synchronize local file system directories to [Bunn
 # Installation
 
 ```bash
-go get github.com/mtyurt/bunnycdn-storage-sync
+go get github.com/veter2005/bunny-storage-sync
 ```
 
 # Usage
