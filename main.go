@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/mtyurt/bunnycdn-storage-sync/api"
-	"github.com/mtyurt/bunnycdn-storage-sync/syncer"
+	"github.com/veter2005/bunny-storage-sync/api"
+	"github.com/veter2005/bunny-storage-sync/syncer"
 )
 
 func main() {
