@@ -14,8 +14,10 @@ import (
 
 // BCDNSyncer is the service that runs sync operation
 type BCDNSyncer struct {
-	API    api.BCDNStorage
-	DryRun bool
+    API         api.BCDNStorage
+    DryRun      bool
+    SizeOnly    bool    // Добавить это поле
+    OnlyMissing bool    // Добавить это поле
 }
 
 // Sync synchronizes sourcePath with storage zone efficiently
