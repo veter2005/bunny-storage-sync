@@ -22,6 +22,27 @@ type BCDNSyncer struct {
 	Verbose     bool    // Enable verbose logging
 }
 
+// operation represents a file operation to be performed
+type operation struct {
+	action   string // "upload"
+	path     string // Full local path
+	relPath  string // Relative path
+	content  []byte // File content
+	checksum string // SHA256 checksum
+	isNew    bool   // Whether this is a new file
+}
+
+// syncMetrics tracks synchronization statistics
+type syncMetrics struct {
+	sync.Mutex
+	total        int
+	newFile      int
+	modifiedFile int
+	deletedFile  int
+	skipped      int
+	errors       int
+}
+
 // Sync synchronizes sourcePath with the BunnyCDN storage zone efficiently
 func (s *BCDNSyncer) Sync(sourcePath string) error {
 	// Validate source path
@@ -42,26 +63,9 @@ func (s *BCDNSyncer) Sync(sourcePath string) error {
 	}
 	s.logDebug("Fetched %d remote objects", len(objMap))
 
-	metrics := struct {
-		sync.Mutex
-		total        int
-		newFile      int
-		modifiedFile int
-		deletedFile  int
-		skipped      int
-		errors       int
-	}{}
+	metrics := &syncMetrics{}
 
 	// Collect all operations
-	type operation struct {
-		action   string // "upload" or "skip"
-		path     string
-		relPath  string
-		content  []byte
-		checksum string
-		isNew    bool
-	}
-
 	operations := []operation{}
 	var opsLock sync.Mutex
 
@@ -200,7 +204,7 @@ func (s *BCDNSyncer) Sync(sourcePath string) error {
 	// Process uploads concurrently
 	if len(operations) > 0 {
 		s.logDebug("Processing %d upload operations with concurrency=%d", len(operations), s.Concurrency)
-		if err := s.processOperationsConcurrently(operations, &metrics); err != nil {
+		if err := s.processOperationsConcurrently(operations, metrics); err != nil {
 			return err
 		}
 	}
@@ -219,7 +223,7 @@ func (s *BCDNSyncer) Sync(sourcePath string) error {
 		metrics.deletedFile = len(deleteOps)
 		metrics.Unlock()
 		
-		if err := s.processDeletesConcurrently(deleteOps, &metrics); err != nil {
+		if err := s.processDeletesConcurrently(deleteOps, metrics); err != nil {
 			return err
 		}
 	}
@@ -244,15 +248,7 @@ func (s *BCDNSyncer) Sync(sourcePath string) error {
 }
 
 // processOperationsConcurrently processes upload operations with controlled concurrency
-func (s *BCDNSyncer) processOperationsConcurrently(operations []operation, metrics *struct {
-	sync.Mutex
-	total        int
-	newFile      int
-	modifiedFile int
-	deletedFile  int
-	skipped      int
-	errors       int
-}) error {
+func (s *BCDNSyncer) processOperationsConcurrently(operations []operation, metrics *syncMetrics) error {
 	sem := make(chan struct{}, s.Concurrency)
 	var wg sync.WaitGroup
 	var errLock sync.Mutex
@@ -286,15 +282,7 @@ func (s *BCDNSyncer) processOperationsConcurrently(operations []operation, metri
 }
 
 // processDeletesConcurrently processes delete operations with controlled concurrency
-func (s *BCDNSyncer) processDeletesConcurrently(deleteOps []string, metrics *struct {
-	sync.Mutex
-	total        int
-	newFile      int
-	modifiedFile int
-	deletedFile  int
-	skipped      int
-	errors       int
-}) error {
+func (s *BCDNSyncer) processDeletesConcurrently(deleteOps []string, metrics *syncMetrics) error {
 	sem := make(chan struct{}, s.Concurrency)
 	var wg sync.WaitGroup
 	var errLock sync.Mutex

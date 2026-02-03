@@ -1,14 +1,16 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"mime"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/levigross/grequests"
 )
 
 // BaseURL for BunnyCDN storage API
@@ -68,19 +70,31 @@ func (s *BCDNStorage) List(path string) ([]BCDNObject, error) {
 	url := fmt.Sprintf("%s/%s/%s/", BaseURL, s.ZoneName, path)
 	log.Printf("DEBUG: Running List of %s\n", url)
 	
-	resp, err := grequests.Get(url, &grequests.RequestOptions{
-		Headers: map[string]string{"AccessKey": s.APIKey},
-	})
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("AccessKey", s.APIKey)
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("list request failed: %w", err)
 	}
+	defer resp.Body.Close()
 	
-	if !resp.Ok {
-		return nil, fmt.Errorf("list failed with status %d: %s", resp.StatusCode, resp.String())
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("list failed with status %d: %s", resp.StatusCode, string(body))
 	}
 	
-	apiResponse := []BCDNObject{}
-	err = resp.JSON(&apiResponse)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	
+	var apiResponse []BCDNObject
+	err = json.Unmarshal(body, &apiResponse)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
@@ -93,19 +107,32 @@ func (s *BCDNStorage) Get(path string) (string, error) {
 	url := fmt.Sprintf("%s/%s/%s", BaseURL, s.ZoneName, path)
 	log.Printf("DEBUG: Running GET for %s\n", url)
 	
-	resp, err := grequests.Get(url, &grequests.RequestOptions{
-		Headers: map[string]string{"AccessKey": s.APIKey},
-	})
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("AccessKey", s.APIKey)
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("get request failed: %w", err)
 	}
+	defer resp.Body.Close()
 	
-	if !resp.Ok {
-		return "", fmt.Errorf("get failed with status %d: %s", resp.StatusCode, resp.String())
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("get failed with status %d: %s", resp.StatusCode, string(body))
 	}
 	
 	log.Println("DEBUG:", resp.Header)
-	return resp.String(), nil
+	
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+	
+	return string(body), nil
 }
 
 // Upload uploads a file to BunnyCDN storage
@@ -115,24 +142,24 @@ func (s *BCDNStorage) Upload(path string, content []byte, checksum string) error
 	log.Printf("DEBUG: Uploading %s/%s with checksum %s (Content-Type: %s)\n", 
 		s.ZoneName, path, checksum, contentType)
 	
-	resp, err := grequests.Put(url, &grequests.RequestOptions{
-		Headers: map[string]string{
-			"AccessKey":    s.APIKey,
-			"Accept":       "*/*",
-			"Content-Type": contentType,
-		},
-		RequestBody: strings.NewReader(string(content)),
-	})
+	req, err := http.NewRequest("PUT", url, bytes.NewReader(content))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("AccessKey", s.APIKey)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Content-Type", contentType)
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("upload request failed: %w", err)
 	}
+	defer resp.Body.Close()
 	
-	if resp.Error != nil {
-		return fmt.Errorf("upload error: %w", resp.Error)
-	}
-	
-	if !resp.Ok {
-		return fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, resp.String())
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(body))
 	}
 	
 	return nil
@@ -143,19 +170,22 @@ func (s *BCDNStorage) Delete(path string) error {
 	url := fmt.Sprintf("%s/%s/%s", BaseURL, s.ZoneName, path)
 	log.Printf("DEBUG: Deleting %s/%s\n", s.ZoneName, path)
 	
-	resp, err := grequests.Delete(url, &grequests.RequestOptions{
-		Headers: map[string]string{"AccessKey": s.APIKey},
-	})
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("AccessKey", s.APIKey)
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("delete request failed: %w", err)
 	}
+	defer resp.Body.Close()
 	
-	if resp.Error != nil {
-		return fmt.Errorf("delete error: %w", resp.Error)
-	}
-	
-	if !resp.Ok {
-		return fmt.Errorf("delete failed with status %d: %s", resp.StatusCode, resp.String())
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete failed with status %d: %s", resp.StatusCode, string(body))
 	}
 	
 	return nil
