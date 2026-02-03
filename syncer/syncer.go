@@ -18,6 +18,7 @@ type BCDNSyncer struct {
 	DryRun      bool
 	SizeOnly    bool    // Flag to compare files by size only
 	OnlyMissing bool    // Flag to upload only missing files
+	Delete      bool    // Flag to delete remote files not present locally
 	Concurrency int     // Number of concurrent upload/delete operations
 	Verbose     bool    // Enable verbose logging
 }
@@ -25,9 +26,8 @@ type BCDNSyncer struct {
 // operation represents a file operation to be performed
 type operation struct {
 	action   string // "upload"
-	path     string // Full local path
-	relPath  string // Relative path
-	content  []byte // File content
+	path     string // Full local path to read from
+	relPath  string // Relative path for storage
 	checksum string // SHA256 checksum
 	isNew    bool   // Whether this is a new file
 }
@@ -44,7 +44,8 @@ type syncMetrics struct {
 }
 
 // Sync synchronizes sourcePath with the BunnyCDN storage zone efficiently
-func (s *BCDNSyncer) Sync(sourcePath string) error {
+// syncPath parameter allows syncing to a subdirectory in the zone (use "" for root)
+func (s *BCDNSyncer) Sync(sourcePath string, syncPath string) error {
 	// Validate source path
 	if _, err := os.Stat(sourcePath); err != nil {
 		return fmt.Errorf("source path error: %w", err)
@@ -55,9 +56,12 @@ func (s *BCDNSyncer) Sync(sourcePath string) error {
 		s.Concurrency = 5
 	}
 
-	// Fetch all remote objects first
-	s.logDebug("Fetching remote objects...")
-	objMap, err := s.fetchAllObjects()
+	// Normalize syncPath (remove leading/trailing slashes)
+	syncPath = strings.Trim(syncPath, "/")
+
+	// Fetch all remote objects first (only from syncPath prefix)
+	s.logDebug("Fetching remote objects from path: %s", syncPath)
+	objMap, err := s.fetchAllObjects(syncPath)
 	if err != nil {
 		return fmt.Errorf("failed to fetch remote objects: %w", err)
 	}
@@ -91,6 +95,11 @@ func (s *BCDNSyncer) Sync(sourcePath string) error {
 
 		// Normalize path for cross-platform compatibility
 		relPath = filepath.ToSlash(relPath)
+		
+		// Add syncPath prefix if specified
+		if syncPath != "" {
+			relPath = syncPath + "/" + relPath
+		}
 
 		metrics.Lock()
 		metrics.total++
@@ -160,8 +169,8 @@ func (s *BCDNSyncer) Sync(sourcePath string) error {
 
 		// Queue upload operation if needed
 		if shouldUpload {
-			// Read file if not already read
-			if fileContent == nil {
+			// Read file if not already read (for checksum)
+			if fileContent == nil && !s.SizeOnly {
 				var err error
 				fileContent, fsChecksum, err = getFileContent(path)
 				if err != nil {
@@ -176,9 +185,8 @@ func (s *BCDNSyncer) Sync(sourcePath string) error {
 			opsLock.Lock()
 			operations = append(operations, operation{
 				action:   "upload",
-				path:     path,
+				path:     path, // Store the file path, not the content
 				relPath:  relPath,
-				content:  fileContent,
 				checksum: fsChecksum,
 				isNew:    !exists,
 			})
@@ -218,13 +226,22 @@ func (s *BCDNSyncer) Sync(sourcePath string) error {
 	}
 
 	if len(deleteOps) > 0 {
-		s.logDebug("Processing %d delete operations", len(deleteOps))
-		metrics.Lock()
-		metrics.deletedFile = len(deleteOps)
-		metrics.Unlock()
-		
-		if err := s.processDeletesConcurrently(deleteOps, metrics); err != nil {
-			return err
+		if s.Delete {
+			// Delete mode is enabled
+			s.logDebug("Processing %d delete operations", len(deleteOps))
+			metrics.Lock()
+			metrics.deletedFile = len(deleteOps)
+			metrics.Unlock()
+			
+			if err := s.processDeletesConcurrently(deleteOps, metrics); err != nil {
+				return err
+			}
+		} else {
+			// Delete mode is disabled - just log what would be deleted
+			log.Printf("INFO: %d files exist remotely but not locally (use --delete to remove them):", len(deleteOps))
+			for _, relPath := range deleteOps {
+				log.Printf("  - %s", relPath)
+			}
 		}
 	}
 
@@ -252,7 +269,7 @@ func (s *BCDNSyncer) processOperationsConcurrently(operations []operation, metri
 	sem := make(chan struct{}, s.Concurrency)
 	var wg sync.WaitGroup
 	var errLock sync.Mutex
-	var firstError error
+	var errors []error
 
 	for _, op := range operations {
 		wg.Add(1)
@@ -261,7 +278,21 @@ func (s *BCDNSyncer) processOperationsConcurrently(operations []operation, metri
 			sem <- struct{}{}        // Acquire semaphore
 			defer func() { <-sem }() // Release semaphore
 
-			err := s.uploadFile(op.relPath, op.content, op.checksum)
+			// Read file content right before upload to minimize memory usage
+			content, checksum, err := getFileContent(op.path)
+			if err != nil {
+				log.Printf("ERROR: failed to read file %s: %v", op.relPath, err)
+				metrics.Lock()
+				metrics.errors++
+				metrics.Unlock()
+				
+				errLock.Lock()
+				errors = append(errors, fmt.Errorf("read %s: %w", op.relPath, err))
+				errLock.Unlock()
+				return
+			}
+
+			err = s.uploadFile(op.relPath, content, checksum)
 			if err != nil {
 				log.Printf("ERROR: upload failed for %s: %v", op.relPath, err)
 				metrics.Lock()
@@ -269,16 +300,20 @@ func (s *BCDNSyncer) processOperationsConcurrently(operations []operation, metri
 				metrics.Unlock()
 
 				errLock.Lock()
-				if firstError == nil {
-					firstError = err
-				}
+				errors = append(errors, fmt.Errorf("upload %s: %w", op.relPath, err))
 				errLock.Unlock()
 			}
 		}(op)
 	}
 
 	wg.Wait()
-	return firstError
+	
+	if len(errors) > 0 {
+		// Return summary of all errors
+		return fmt.Errorf("%d upload errors occurred (first: %v)", len(errors), errors[0])
+	}
+	
+	return nil
 }
 
 // processDeletesConcurrently processes delete operations with controlled concurrency
@@ -286,7 +321,7 @@ func (s *BCDNSyncer) processDeletesConcurrently(deleteOps []string, metrics *syn
 	sem := make(chan struct{}, s.Concurrency)
 	var wg sync.WaitGroup
 	var errLock sync.Mutex
-	var firstError error
+	var errors []error
 
 	for _, relPath := range deleteOps {
 		wg.Add(1)
@@ -304,20 +339,24 @@ func (s *BCDNSyncer) processDeletesConcurrently(deleteOps []string, metrics *syn
 				metrics.Unlock()
 
 				errLock.Lock()
-				if firstError == nil {
-					firstError = err
-				}
+				errors = append(errors, fmt.Errorf("delete %s: %w", relPath, err))
 				errLock.Unlock()
 			}
 		}(relPath)
 	}
 
 	wg.Wait()
-	return firstError
+	
+	if len(errors) > 0 {
+		// Return summary of all errors
+		return fmt.Errorf("%d delete errors occurred (first: %v)", len(errors), errors[0])
+	}
+	
+	return nil
 }
 
-// fetchAllObjects recursively fetches all objects from the storage zone
-func (s *BCDNSyncer) fetchAllObjects() (map[string]api.BCDNObject, error) {
+// fetchAllObjects recursively fetches all objects from the storage zone starting from prefix
+func (s *BCDNSyncer) fetchAllObjects(prefix string) (map[string]api.BCDNObject, error) {
 	objMap := make(map[string]api.BCDNObject)
 	
 	// Use a queue to handle recursive directory fetching
@@ -325,7 +364,7 @@ func (s *BCDNSyncer) fetchAllObjects() (map[string]api.BCDNObject, error) {
 		path string
 	}
 	
-	queue := []dirToFetch{{path: ""}}
+	queue := []dirToFetch{{path: prefix}}
 	processed := make(map[string]bool)
 	
 	for len(queue) > 0 {

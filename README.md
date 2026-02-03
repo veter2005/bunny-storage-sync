@@ -139,7 +139,7 @@ bunny-storage-sync --only-missing ./new-content content-zone
 ## Output Example
 
 ```
-BunnyCDN Storage Sync v1.1.0
+BunnyCDN Storage Sync v1.2.0
 =======================
 Source path:  ./website
 Zone name:    my-zone
