@@ -1,7 +1,6 @@
 package api
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"mime"
@@ -66,13 +65,12 @@ func (t *BCDNTime) UnmarshalJSON(buf []byte) error {
 
 // List returns BCDNObject list that exists under the path
 func (s *BCDNStorage) List(path string) ([]BCDNObject, error) {
-	ro := &grequests.RequestOptions{
-		Headers: map[string]string{"AccessKey": s.APIKey},
-	}
 	url := fmt.Sprintf("%s/%s/%s/", BaseURL, s.ZoneName, path)
 	log.Printf("DEBUG: Running List of %s\n", url)
 	
-	resp, err := grequests.Get(url, ro)
+	resp, err := grequests.Get(url, &grequests.RequestOptions{
+		Headers: map[string]string{"AccessKey": s.APIKey},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list request failed: %w", err)
 	}
@@ -92,13 +90,12 @@ func (s *BCDNStorage) List(path string) ([]BCDNObject, error) {
 
 // Get fetches file from BCDN storage and returns the content.
 func (s *BCDNStorage) Get(path string) (string, error) {
-	ro := &grequests.RequestOptions{
-		Headers: map[string]string{"AccessKey": s.APIKey},
-	}
 	url := fmt.Sprintf("%s/%s/%s", BaseURL, s.ZoneName, path)
 	log.Printf("DEBUG: Running GET for %s\n", url)
 	
-	resp, err := grequests.Get(url, ro)
+	resp, err := grequests.Get(url, &grequests.RequestOptions{
+		Headers: map[string]string{"AccessKey": s.APIKey},
+	})
 	if err != nil {
 		return "", fmt.Errorf("get request failed: %w", err)
 	}
@@ -114,20 +111,18 @@ func (s *BCDNStorage) Get(path string) (string, error) {
 // Upload uploads a file to BunnyCDN storage
 func (s *BCDNStorage) Upload(path string, content []byte, checksum string) error {
 	contentType := detectContentType(path)
-	ro := &grequests.RequestOptions{
+	url := fmt.Sprintf("%s/%s/%s", BaseURL, s.ZoneName, path)
+	log.Printf("DEBUG: Uploading %s/%s with checksum %s (Content-Type: %s)\n", 
+		s.ZoneName, path, checksum, contentType)
+	
+	resp, err := grequests.Put(url, &grequests.RequestOptions{
 		Headers: map[string]string{
 			"AccessKey":    s.APIKey,
 			"Accept":       "*/*",
 			"Content-Type": contentType,
 		},
 		RequestBody: strings.NewReader(string(content)),
-	}
-	
-	url := fmt.Sprintf("%s/%s/%s", BaseURL, s.ZoneName, path)
-	log.Printf("DEBUG: Uploading %s/%s with checksum %s (Content-Type: %s)\n", 
-		s.ZoneName, path, checksum, contentType)
-	
-	resp, err := grequests.Put(url, ro)
+	})
 	if err != nil {
 		return fmt.Errorf("upload request failed: %w", err)
 	}
@@ -145,13 +140,12 @@ func (s *BCDNStorage) Upload(path string, content []byte, checksum string) error
 
 // Delete path from BunnyCDN storage
 func (s *BCDNStorage) Delete(path string) error {
-	ro := &grequests.RequestOptions{
-		Headers: map[string]string{"AccessKey": s.APIKey},
-	}
 	url := fmt.Sprintf("%s/%s/%s", BaseURL, s.ZoneName, path)
 	log.Printf("DEBUG: Deleting %s/%s\n", s.ZoneName, path)
 	
-	resp, err := grequests.Delete(url, ro)
+	resp, err := grequests.Delete(url, &grequests.RequestOptions{
+		Headers: map[string]string{"AccessKey": s.APIKey},
+	})
 	if err != nil {
 		return fmt.Errorf("delete request failed: %w", err)
 	}
