@@ -3,11 +3,11 @@ package syncer
 import (
 	"crypto/sha256"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/veter2005/bunny-storage-sync/api"
 )
@@ -18,42 +18,91 @@ type BCDNSyncer struct {
 	DryRun      bool
 	SizeOnly    bool    // Flag to compare files by size only
 	OnlyMissing bool    // Flag to upload only missing files
+	Concurrency int     // Number of concurrent upload/delete operations
+	Verbose     bool    // Enable verbose logging
 }
 
 // Sync synchronizes sourcePath with the BunnyCDN storage zone efficiently
 func (s *BCDNSyncer) Sync(sourcePath string) error {
-	objMap := make(map[string]api.BCDNObject)
+	// Validate source path
+	if _, err := os.Stat(sourcePath); err != nil {
+		return fmt.Errorf("source path error: %w", err)
+	}
+
+	// Set default concurrency if not specified
+	if s.Concurrency <= 0 {
+		s.Concurrency = 5
+	}
+
+	// Fetch all remote objects first
+	s.logDebug("Fetching remote objects...")
+	objMap, err := s.fetchAllObjects()
+	if err != nil {
+		return fmt.Errorf("failed to fetch remote objects: %w", err)
+	}
+	s.logDebug("Fetched %d remote objects", len(objMap))
 
 	metrics := struct {
+		sync.Mutex
 		total        int
 		newFile      int
 		modifiedFile int
 		deletedFile  int
-	}{0, 0, 0, 0}
+		skipped      int
+		errors       int
+	}{}
 
-	err := filepath.Walk(sourcePath, func(path string, info os.FileInfo, err error) error {
+	// Collect all operations
+	type operation struct {
+		action   string // "upload" or "skip"
+		path     string
+		relPath  string
+		content  []byte
+		checksum string
+		isNew    bool
+	}
+
+	operations := []operation{}
+	var opsLock sync.Mutex
+
+	// Walk the filesystem and determine what needs to be done
+	err = filepath.Walk(sourcePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			log.Printf("Error accessing path %q: %v\n", path, err)
-			return err
+			log.Printf("ERROR: accessing path %q: %v\n", path, err)
+			metrics.Lock()
+			metrics.errors++
+			metrics.Unlock()
+			return nil // Continue walking despite errors
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
 		}
 
 		relPath, err := filepath.Rel(sourcePath, path)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get relative path: %w", err)
 		}
 
-		// If it's a directory, fetch the list of objects from the API
-		if info.IsDir() {
-			return s.fetchDirectory(objMap, relPath)
-		}
+		// Normalize path for cross-platform compatibility
+		relPath = filepath.ToSlash(relPath)
 
-		metrics.total += 1
+		metrics.Lock()
+		metrics.total++
+		metrics.Unlock()
+
 		obj, exists := objMap[relPath]
 
-		// 1. Check OnlyMissing flag: if file exists in storage, skip it
+		// Check OnlyMissing flag: if file exists in storage, skip it
 		if s.OnlyMissing && exists {
-			log.Printf("DEBUG: %s exists, skipping (only-missing mode)\n", relPath)
+			s.logDebug("%s exists, skipping (only-missing mode)", relPath)
+			opsLock.Lock()
 			delete(objMap, relPath)
+			opsLock.Unlock()
+			metrics.Lock()
+			metrics.skipped++
+			metrics.Unlock()
 			return nil
 		}
 
@@ -61,108 +110,311 @@ func (s *BCDNSyncer) Sync(sourcePath string) error {
 		var fileContent []byte
 		var fsChecksum string
 
-		// 2. Decide if upload is necessary
+		// Decide if upload is necessary
 		if !exists {
-			log.Printf("DEBUG: %s not found in storage, marking for upload\n", relPath)
-			metrics.newFile += 1
+			s.logDebug("%s not found in storage, marking for upload", relPath)
+			metrics.Lock()
+			metrics.newFile++
+			metrics.Unlock()
 			shouldUpload = true
 		} else {
 			if s.SizeOnly {
 				// Compare by size only
 				if int64(obj.Length) != info.Size() {
-					log.Printf("DEBUG: %s size mismatch (Local: %d, Remote: %d), marking for upload\n", relPath, info.Size(), obj.Length)
-					metrics.modifiedFile += 1
+					s.logDebug("%s size mismatch (Local: %d, Remote: %d), marking for upload", 
+						relPath, info.Size(), obj.Length)
+					metrics.Lock()
+					metrics.modifiedFile++
+					metrics.Unlock()
 					shouldUpload = true
 				} else {
-					log.Printf("DEBUG: %s size matches, skipping\n", relPath)
+					s.logDebug("%s size matches, skipping", relPath)
 				}
 			} else {
 				// Standard comparison by checksum
 				var err error
 				fileContent, fsChecksum, err = getFileContent(path)
 				if err != nil {
-					return err
+					log.Printf("ERROR: reading file %s: %v\n", relPath, err)
+					metrics.Lock()
+					metrics.errors++
+					metrics.Unlock()
+					return nil // Continue despite error
 				}
 
-				if strings.ToLower(fsChecksum) != strings.ToLower(obj.Checksum) {
-					log.Printf("DEBUG: %s checksum mismatch, marking for upload\n", relPath)
-					metrics.modifiedFile += 1
-					shouldUpload = true
+				if strings.EqualFold(fsChecksum, obj.Checksum) {
+					s.logDebug("%s matches checksum, skipping", relPath)
 				} else {
-					log.Printf("DEBUG: %s matches checksum, skipping\n", relPath)
+					s.logDebug("%s checksum mismatch, marking for upload", relPath)
+					metrics.Lock()
+					metrics.modifiedFile++
+					metrics.Unlock()
+					shouldUpload = true
 				}
 			}
 		}
 
-		// 3. Perform upload if required
+		// Queue upload operation if needed
 		if shouldUpload {
+			// Read file if not already read
 			if fileContent == nil {
 				var err error
 				fileContent, fsChecksum, err = getFileContent(path)
 				if err != nil {
-					return err
+					log.Printf("ERROR: reading file %s: %v\n", relPath, err)
+					metrics.Lock()
+					metrics.errors++
+					metrics.Unlock()
+					return nil
 				}
 			}
-			err = s.uploadFile(relPath, fileContent, fsChecksum)
-			if err != nil {
-				return err
-			}
+
+			opsLock.Lock()
+			operations = append(operations, operation{
+				action:   "upload",
+				path:     path,
+				relPath:  relPath,
+				content:  fileContent,
+				checksum: fsChecksum,
+				isNew:    !exists,
+			})
+			opsLock.Unlock()
+		} else {
+			metrics.Lock()
+			metrics.skipped++
+			metrics.Unlock()
 		}
 
 		// Remove from map to track files that exist only in storage
+		opsLock.Lock()
 		delete(objMap, relPath)
+		opsLock.Unlock()
+
 		return nil
 	})
 
-	// Delete objects that remain in the map (exist in storage but not locally)
-	for relPath, obj := range objMap {
-		if !obj.IsDirectory {
-			metrics.deletedFile += 1
-			log.Printf("INFO: %s not found locally, deleting from storage\n", relPath)
-			s.deletePath(relPath)
+	if err != nil {
+		return fmt.Errorf("filesystem walk failed: %w", err)
+	}
+
+	// Process uploads concurrently
+	if len(operations) > 0 {
+		s.logDebug("Processing %d upload operations with concurrency=%d", len(operations), s.Concurrency)
+		if err := s.processOperationsConcurrently(operations, &metrics); err != nil {
+			return err
 		}
 	}
 
-	log.Printf("Summary: Total files: %d, New: %d, Modified: %d, Deleted: %d\n", metrics.total, metrics.newFile, metrics.modifiedFile, metrics.deletedFile)
-	return err
-}
+	// Delete objects that remain in the map (exist in storage but not locally)
+	deleteOps := []string{}
+	for relPath, obj := range objMap {
+		if !obj.IsDirectory {
+			deleteOps = append(deleteOps, relPath)
+		}
+	}
 
-// fetchDirectory fetches path from BunnyCDN API & stores objects in a map
-func (s *BCDNSyncer) fetchDirectory(objMap map[string]api.BCDNObject, path string) error {
-	log.Printf("DEBUG: Fetching directory %s\n", path)
-	objects, err := s.API.List(path)
-	if err != nil {
-		return err
+	if len(deleteOps) > 0 {
+		s.logDebug("Processing %d delete operations", len(deleteOps))
+		metrics.Lock()
+		metrics.deletedFile = len(deleteOps)
+		metrics.Unlock()
+		
+		if err := s.processDeletesConcurrently(deleteOps, &metrics); err != nil {
+			return err
+		}
 	}
-	zoneName := s.API.ZoneName
-	for _, obj := range objects {
-		objPath := strings.TrimPrefix(obj.Path+obj.ObjectName, "/"+zoneName+"/")
-		objMap[objPath] = obj
+
+	// Print summary
+	log.Printf("=== Sync Summary ===")
+	log.Printf("Total files scanned: %d", metrics.total)
+	log.Printf("New files uploaded: %d", metrics.newFile)
+	log.Printf("Modified files updated: %d", metrics.modifiedFile)
+	log.Printf("Files deleted: %d", metrics.deletedFile)
+	log.Printf("Files skipped: %d", metrics.skipped)
+	if metrics.errors > 0 {
+		log.Printf("Errors encountered: %d", metrics.errors)
 	}
+	log.Printf("===================")
+
+	if metrics.errors > 0 {
+		return fmt.Errorf("sync completed with %d errors", metrics.errors)
+	}
+
 	return nil
 }
 
+// processOperationsConcurrently processes upload operations with controlled concurrency
+func (s *BCDNSyncer) processOperationsConcurrently(operations []operation, metrics *struct {
+	sync.Mutex
+	total        int
+	newFile      int
+	modifiedFile int
+	deletedFile  int
+	skipped      int
+	errors       int
+}) error {
+	sem := make(chan struct{}, s.Concurrency)
+	var wg sync.WaitGroup
+	var errLock sync.Mutex
+	var firstError error
+
+	for _, op := range operations {
+		wg.Add(1)
+		go func(op operation) {
+			defer wg.Done()
+			sem <- struct{}{}        // Acquire semaphore
+			defer func() { <-sem }() // Release semaphore
+
+			err := s.uploadFile(op.relPath, op.content, op.checksum)
+			if err != nil {
+				log.Printf("ERROR: upload failed for %s: %v", op.relPath, err)
+				metrics.Lock()
+				metrics.errors++
+				metrics.Unlock()
+
+				errLock.Lock()
+				if firstError == nil {
+					firstError = err
+				}
+				errLock.Unlock()
+			}
+		}(op)
+	}
+
+	wg.Wait()
+	return firstError
+}
+
+// processDeletesConcurrently processes delete operations with controlled concurrency
+func (s *BCDNSyncer) processDeletesConcurrently(deleteOps []string, metrics *struct {
+	sync.Mutex
+	total        int
+	newFile      int
+	modifiedFile int
+	deletedFile  int
+	skipped      int
+	errors       int
+}) error {
+	sem := make(chan struct{}, s.Concurrency)
+	var wg sync.WaitGroup
+	var errLock sync.Mutex
+	var firstError error
+
+	for _, relPath := range deleteOps {
+		wg.Add(1)
+		go func(relPath string) {
+			defer wg.Done()
+			sem <- struct{}{}        // Acquire semaphore
+			defer func() { <-sem }() // Release semaphore
+
+			log.Printf("INFO: %s not found locally, deleting from storage", relPath)
+			err := s.deletePath(relPath)
+			if err != nil {
+				log.Printf("ERROR: delete failed for %s: %v", relPath, err)
+				metrics.Lock()
+				metrics.errors++
+				metrics.Unlock()
+
+				errLock.Lock()
+				if firstError == nil {
+					firstError = err
+				}
+				errLock.Unlock()
+			}
+		}(relPath)
+	}
+
+	wg.Wait()
+	return firstError
+}
+
+// fetchAllObjects recursively fetches all objects from the storage zone
+func (s *BCDNSyncer) fetchAllObjects() (map[string]api.BCDNObject, error) {
+	objMap := make(map[string]api.BCDNObject)
+	
+	// Use a queue to handle recursive directory fetching
+	type dirToFetch struct {
+		path string
+	}
+	
+	queue := []dirToFetch{{path: ""}}
+	processed := make(map[string]bool)
+	
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		
+		// Skip if already processed
+		if processed[current.path] {
+			continue
+		}
+		processed[current.path] = true
+		
+		s.logDebug("Fetching directory: %s", current.path)
+		objects, err := s.API.List(current.path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list %s: %w", current.path, err)
+		}
+		
+		zoneName := s.API.ZoneName
+		for _, obj := range objects {
+			// Construct the object path
+			fullPath := obj.Path
+			if !strings.HasSuffix(fullPath, "/") && fullPath != "" {
+				fullPath += "/"
+			}
+			fullPath += obj.ObjectName
+			
+			// Remove zone name prefix and leading slash
+			objPath := strings.TrimPrefix(fullPath, "/"+zoneName+"/")
+			objPath = strings.TrimPrefix(objPath, zoneName+"/")
+			objPath = strings.TrimPrefix(objPath, "/")
+			
+			// Normalize path
+			objPath = filepath.ToSlash(filepath.Clean(objPath))
+			
+			if obj.IsDirectory {
+				// Queue subdirectory for fetching
+				queue = append(queue, dirToFetch{path: objPath})
+			} else {
+				// Add file to map
+				objMap[objPath] = obj
+			}
+		}
+	}
+	
+	return objMap, nil
+}
+
 func (s *BCDNSyncer) uploadFile(path string, content []byte, checksum string) error {
-	log.Printf("Uploading file %s with checksum %s\n", path, checksum)
+	log.Printf("Uploading file %s (size: %d bytes, checksum: %s)", path, len(content), checksum)
 	if s.DryRun {
+		log.Printf("DRY-RUN: Would upload %s", path)
 		return nil
 	}
 	return s.API.Upload(path, content, checksum)
 }
 
 func (s *BCDNSyncer) deletePath(path string) error {
-	log.Printf("Deleting file %s\n", path)
+	log.Printf("Deleting file %s", path)
 	if s.DryRun {
+		log.Printf("DRY-RUN: Would delete %s", path)
 		return nil
 	}
 	return s.API.Delete(path)
 }
 
+func (s *BCDNSyncer) logDebug(format string, args ...interface{}) {
+	if s.Verbose {
+		log.Printf("DEBUG: "+format, args...)
+	}
+}
+
 // getFileContent reads file from disk and calculates SHA256 checksum
 func getFileContent(path string) ([]byte, string, error) {
-	fileContent, err := ioutil.ReadFile(path)
+	fileContent, err := os.ReadFile(path)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("failed to read file: %w", err)
 	}
 	checksum := sha256.Sum256(fileContent)
 	return fileContent, fmt.Sprintf("%x", checksum), nil
