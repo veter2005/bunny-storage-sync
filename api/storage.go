@@ -13,16 +13,14 @@ import (
 	"time"
 )
 
-// BaseURL for BunnyCDN storage API
 const BaseURL = "https://storage.bunnycdn.com"
 
-// BCDNStorage contains storage & access information
 type BCDNStorage struct {
 	ZoneName string
 	APIKey   string
+	Verbose  bool // Флаг для контроля логирования
 }
 
-// BCDNObject maps to BunnyCDN Storage API's response object
 type BCDNObject struct {
 	GUID            string   `json:"Guid"`
 	StorageZoneName string   `json:"StorageZoneName"`
@@ -39,12 +37,10 @@ type BCDNObject struct {
 	ReplicatedZones string   `json:"ReplicatedZones"`
 }
 
-// BCDNTime is used to parse BCDNObject time
 type BCDNTime struct {
 	time.Time
 }
 
-// UnmarshalJSON uses 3 formats for datetime objects
 func (t *BCDNTime) UnmarshalJSON(buf []byte) error {
 	trimmed := strings.Trim(string(buf), `"`)
 	formats := []string{
@@ -65,10 +61,16 @@ func (t *BCDNTime) UnmarshalJSON(buf []byte) error {
 	return latestError
 }
 
-// List returns BCDNObject list that exists under the path
+// logDebug выводит сообщения только если включен Verbose
+func (s *BCDNStorage) logDebug(format string, args ...interface{}) {
+	if s.Verbose {
+		log.Printf("DEBUG: [API] "+format, args...)
+	}
+}
+
 func (s *BCDNStorage) List(path string) ([]BCDNObject, error) {
 	url := fmt.Sprintf("%s/%s/%s/", BaseURL, s.ZoneName, path)
-	log.Printf("DEBUG: Running List of %s\n", url)
+	s.logDebug("Listing directory: %s", path)
 	
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -102,10 +104,9 @@ func (s *BCDNStorage) List(path string) ([]BCDNObject, error) {
 	return apiResponse, nil
 }
 
-// Get fetches file from BCDN storage and returns the content.
 func (s *BCDNStorage) Get(path string) (string, error) {
 	url := fmt.Sprintf("%s/%s/%s", BaseURL, s.ZoneName, path)
-	log.Printf("DEBUG: Running GET for %s\n", url)
+	s.logDebug("Running GET for %s", url)
 	
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -125,8 +126,6 @@ func (s *BCDNStorage) Get(path string) (string, error) {
 		return "", fmt.Errorf("get failed with status %d: %s", resp.StatusCode, string(body))
 	}
 	
-	log.Println("DEBUG:", resp.Header)
-	
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
@@ -135,12 +134,10 @@ func (s *BCDNStorage) Get(path string) (string, error) {
 	return string(body), nil
 }
 
-// Upload uploads a file to BunnyCDN storage
 func (s *BCDNStorage) Upload(path string, content []byte, checksum string) error {
 	contentType := detectContentType(path)
 	url := fmt.Sprintf("%s/%s/%s", BaseURL, s.ZoneName, path)
-	log.Printf("DEBUG: Uploading %s/%s with checksum %s (Content-Type: %s)\n", 
-		s.ZoneName, path, checksum, contentType)
+	s.logDebug("Uploading %s/%s (Type: %s)", s.ZoneName, path, contentType)
 	
 	req, err := http.NewRequest("PUT", url, bytes.NewReader(content))
 	if err != nil {
@@ -165,10 +162,9 @@ func (s *BCDNStorage) Upload(path string, content []byte, checksum string) error
 	return nil
 }
 
-// Delete path from BunnyCDN storage
 func (s *BCDNStorage) Delete(path string) error {
 	url := fmt.Sprintf("%s/%s/%s", BaseURL, s.ZoneName, path)
-	log.Printf("DEBUG: Deleting %s/%s\n", s.ZoneName, path)
+	s.logDebug("Deleting %s/%s", s.ZoneName, path)
 	
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
@@ -191,17 +187,14 @@ func (s *BCDNStorage) Delete(path string) error {
 	return nil
 }
 
-// detectContentType detects the MIME type based on file extension
 func detectContentType(path string) string {
 	ext := filepath.Ext(path)
 	if ext == "" {
 		return "application/octet-stream"
 	}
-	
 	contentType := mime.TypeByExtension(ext)
 	if contentType == "" {
 		return "application/octet-stream"
 	}
-	
 	return contentType
 }
