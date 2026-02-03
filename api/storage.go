@@ -18,7 +18,7 @@ const BaseURL = "https://storage.bunnycdn.com"
 type BCDNStorage struct {
 	ZoneName string
 	APIKey   string
-	Verbose  bool // Флаг для контроля логирования
+	Verbose  bool
 }
 
 type BCDNObject struct {
@@ -61,7 +61,6 @@ func (t *BCDNTime) UnmarshalJSON(buf []byte) error {
 	return latestError
 }
 
-// logDebug выводит сообщения только если включен Verbose
 func (s *BCDNStorage) logDebug(format string, args ...interface{}) {
 	if s.Verbose {
 		log.Printf("DEBUG: [API] "+format, args...)

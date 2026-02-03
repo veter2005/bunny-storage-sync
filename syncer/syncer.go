@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/veter2005/bunny-storage-sync/api"
 )
@@ -183,17 +184,17 @@ func (s *BCDNSyncer) Sync(sourcePath string, syncPath string) error {
 	return nil
 }
 
-// Параллельный сбор списка объектов
 func (s *BCDNSyncer) fetchAllObjectsParallel(rootPrefix string) (map[string]api.BCDNObject, error) {
 	objMap := make(map[string]api.BCDNObject)
 	var mapLock sync.Mutex
-	dirQueue := make(chan string, 10000)
+
+	dirQueue := make(chan string, 100000)
 	var wg sync.WaitGroup
 	var errOnce sync.Once
 	var fetchErr error
 
-	dirQueue <- rootPrefix
 	wg.Add(1)
+	dirQueue <- rootPrefix
 
 	for i := 0; i < s.Concurrency; i++ {
 		go func() {
@@ -219,7 +220,9 @@ func (s *BCDNSyncer) fetchAllObjectsParallel(rootPrefix string) (map[string]api.
 
 					if obj.IsDirectory {
 						wg.Add(1)
-						dirQueue <- objPath
+						go func(p string) {
+							dirQueue <- p
+						}(objPath)
 					} else {
 						mapLock.Lock()
 						objMap[objPath] = obj
@@ -231,12 +234,19 @@ func (s *BCDNSyncer) fetchAllObjectsParallel(rootPrefix string) (map[string]api.
 		}()
 	}
 
+	waitDone := make(chan struct{})
 	go func() {
 		wg.Wait()
 		close(dirQueue)
+		close(waitDone)
 	}()
 
-	for range dirQueue {} 
+	select {
+	case <-waitDone:
+	case <-time.After(15 * time.Minute):
+		return nil, fmt.Errorf("listing timeout: possible network issue or massive directory structure")
+	}
+
 	return objMap, fetchErr
 }
 

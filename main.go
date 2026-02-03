@@ -4,13 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/veter2005/bunny-storage-sync/api"
 	"github.com/veter2005/bunny-storage-sync/syncer"
 )
 
-const version = "1.2.1"
+const version = "1.2.2"
 
 func main() {
 	var dryRun, sizeOnly, onlyMissing, deleteRemote, verbose, showVersion bool
@@ -46,7 +45,7 @@ func main() {
 	storage := api.BCDNStorage{
 		ZoneName: flag.Arg(1),
 		APIKey:   apiKey,
-		Verbose:  verbose, // Передаем флаг в API
+		Verbose:  verbose, 
 	}
 
 	syncerService := syncer.BCDNSyncer{
